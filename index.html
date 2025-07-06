@@ -27,6 +27,7 @@
         .btn-secondary:hover { background-color: #d1d5db; }
         .input-field { width: 100%; padding: 0.5rem 0.75rem; border: 1px solid #d1d5db; border-radius: 0.375rem; transition: border-color 0.2s, box-shadow 0.2s; }
         .input-field:focus { outline: none; border-color: #4f46e5; box-shadow: 0 0 0 2px #c7d2fe; }
+        .input-field:disabled { background-color: #e5e7eb; cursor: not-allowed; }
         #toast { position: fixed; top: 20px; right: 20px; padding: 1rem 1.5rem; border-radius: 0.5rem; color: white; font-weight: 600; z-index: 9999; opacity: 0; transition: opacity 0.5s, transform 0.5s; transform: translateY(-20px); }
         #toast.show { opacity: 1; transform: translateY(0); }
         #toast.success { background-color: #22c55e; }
@@ -78,7 +79,8 @@
                 <div class="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-6 mb-8">
                     <div class="card">
                         <h2 class="text-xl font-semibold mb-4 text-gray-700">1. Cargar Catálogo (CSV)</h2>
-                        <input type="file" id="csv-file-input" accept=".csv" class="input-field file:mr-4 file:py-2 file:px-4 file:rounded-md file:border-0 file:text-sm file:font-semibold file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100">
+                        <input type="file" id="csv-file-input" accept=".csv" class="input-field file:mr-4 file:py-2 file:px-4 file:rounded-md file:border-0 file:text-sm file:font-semibold file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100" disabled>
+                        <p id="csv-helper" class="text-sm text-gray-500 mt-2">Inicie sesión para activar la carga.</p>
                     </div>
                     <div class="card">
                         <h2 class="text-xl font-semibold mb-4 text-gray-700">2. Registrar Venta</h2>
@@ -204,6 +206,7 @@
         const formModifyStock = document.getElementById('form-modify-stock');
         const dashboardBody = document.getElementById('dashboard-body');
         const csvFileInput = document.getElementById('csv-file-input');
+        const csvHelper = document.getElementById('csv-helper');
         const btnDescargarCSV = document.getElementById('btn-descargar-csv');
         const btnLimpiarDatos = document.getElementById('btn-limpiar-datos');
         const btnUnlockAdmin = document.getElementById('btn-unlock-admin');
@@ -381,6 +384,8 @@
                         stockTeoricoCol = collection(db, `businesses/${BUSINESS_ID}/stockTeorico`);
                         datosVentasCol = collection(db, `businesses/${BUSINESS_ID}/datosVentas`);
                         datosConteoCol = collection(db, `businesses/${BUSINESS_ID}/datosConteo`);
+                        csvFileInput.disabled = false;
+                        csvHelper.textContent = 'Seleccione un archivo CSV para cargar.';
                         setupFirestoreListeners();
                     } else {
                         await signOut(auth); showModal('Acceso denegado. Usuario no pertenece a este negocio.');
@@ -393,6 +398,8 @@
                 userId = null; userEmail = null;
                 userIdDisplay.textContent = 'No autenticado';
                 authSection.style.display = 'flex'; appContent.style.display = 'none';
+                csvFileInput.disabled = true;
+                csvHelper.textContent = 'Inicie sesión para activar la carga.';
                 stockTeorico = []; datosVentas = []; datosConteo = [];
                 renderDashboard();
             }
@@ -581,34 +588,104 @@
         formCorreccion.addEventListener('submit', corregirConteo);
         formAnulacion.addEventListener('submit', anularVenta);
         formModifyStock.addEventListener('submit', handleStockModification);
+        
         csvFileInput.addEventListener('change', async (e) => {
+            if (!stockTeoricoCol) {
+                console.error("Intento de carga de CSV antes de que la colección de Firestore esté inicializada.");
+                showModal("Error: La aplicación no está lista. Por favor, espera un momento y vuelve a intentarlo.");
+                e.target.value = '';
+                return;
+            }
+
             const file = e.target.files[0];
-            if (!file) return;
+            if (!file) {
+                console.log("No se seleccionó ningún archivo.");
+                return;
+            }
+            console.log("Archivo seleccionado:", file.name);
             showToast('Procesando archivo CSV...');
-            const text = await file.text();
-            const rows = text.split('\n').filter(row => row.trim() !== '').slice(1);
-            const batch = writeBatch(db);
             
-            rows.forEach(row => {
-                const cols = row.split(';');
-                if (cols.length < 3) return;
-                
-                const docRef = doc(collection(stockTeoricoCol)); 
-                batch.set(docRef, { 
-                    sku: normalizarSku(cols[0]), 
-                    descripcion: cols[1].trim(), 
-                    stock: parseInt(cols[2], 10) || 0
-                });
-            });
             try {
+                const text = await file.text();
+                console.log("Contenido del archivo leído (primeros 500 caracteres):", text.substring(0, 500));
+                
+                const rawLines = text.replace(/\r/g, '').split('\n');
+                const header = rawLines.shift();
+                const stitchedRows = [];
+
+                rawLines.forEach(line => {
+                    const trimmedLine = line.trim();
+                    if (trimmedLine === '') return;
+
+                    const columns = trimmedLine.split(';');
+
+                    if (columns.length >= 3 && stitchedRows.length > 0) {
+                         stitchedRows.push(trimmedLine);
+                    } else if (stitchedRows.length > 0) {
+                        stitchedRows[stitchedRows.length - 1] += ' ' + trimmedLine;
+                    } else if (columns.length >= 3) {
+                         stitchedRows.push(trimmedLine);
+                    }
+                });
+                
+                const rows = stitchedRows.map(row => row.split(';').map(col => col.trim()));
+                
+                if (rows.length === 0) {
+                    console.error("El archivo CSV no contiene filas de datos que se puedan procesar.");
+                    showModal('El archivo CSV está vacío o tiene un formato completamente irreconocible.');
+                    return;
+                }
+                console.log(`Se encontraron ${rows.length} filas de datos para procesar.`);
+
+                const batch = writeBatch(db);
+                let skippedRows = 0;
+                
+                rows.forEach((cols, index) => {
+                    if (cols.length < 3) {
+                        console.warn(`Fila ${index + 2} omitida: formato incorrecto (menos de 3 columnas). Contenido:`, cols.join(';'));
+                        skippedRows++;
+                        return;
+                    }
+                    
+                    const sku = normalizarSku(cols[0]);
+                    const descripcion = cols[1];
+                    const stock = parseInt(cols[2], 10);
+
+                    if (!sku || isNaN(stock)) {
+                        console.warn(`Fila ${index + 2} omitida: SKU vacío o stock no es un número. Contenido:`, cols.join(';'));
+                        skippedRows++;
+                        return;
+                    }
+                    
+                    // ===== CORRECCIÓN APLICADA AQUÍ =====
+                    // Se crea una referencia a un nuevo documento dentro de la colección existente.
+                    // El error era llamar a collection() sobre una variable que ya era una colección.
+                    const docRef = doc(stockTeoricoCol); 
+                    batch.set(docRef, { 
+                        sku: sku, 
+                        descripcion: descripcion, 
+                        stock: stock
+                    });
+                });
+
+                if (rows.length === skippedRows) {
+                    showModal('No se pudo procesar ninguna fila del archivo. Revisa el formato del CSV y la consola para más detalles.');
+                    return;
+                }
+
                 await batch.commit();
-                showToast(`Catálogo cargado con ${rows.length} productos.`);
+                let message = `Catálogo cargado con ${rows.length - skippedRows} productos.`;
+                if (skippedRows > 0) {
+                    message += ` Se omitieron ${skippedRows} filas por formato incorrecto.`;
+                }
+                showModal(message);
                 e.target.value = ''; 
             } catch (error) {
-                console.error("Error al cargar CSV:", error);
+                console.error("Error catastrófico durante el procesamiento del CSV:", error);
                 showModal(`Error al cargar el catálogo. Código: ${error.code}. Revisa la consola.`);
             }
         });
+
         btnDescargarCSV.addEventListener('click', () => {
             const data = getDashboardData();
             const headers = ["Prioridad", "SKU", "Descripción", "Estado", "Dif. Auditoría", "Stock Final Real", "Stock Teórico", "Físico Contado", "Total Vendido"];
